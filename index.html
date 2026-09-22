@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<title>wallp</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+  }
+  body { cursor: none; }
+  body.show-cursor { cursor: default; }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    background: #000;
+  }
+
+  .layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    object-position: center;
+    opacity: 0;
+    transition: opacity 900ms ease;
+    /* keep colours honest, avoid resample blur from odd transforms */
+    image-orientation: from-image;
+    will-change: opacity;
+    user-select: none;
+    -webkit-user-drag: none;
+  }
+  .layer.visible { opacity: 1; }
+
+  #message {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-items: center;
+    padding: 2rem;
+    text-align: center;
+    font: 500 1rem/1.5 system-ui, sans-serif;
+    color: #888;
+  }
+  #message.on { display: grid; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <img class="layer" id="layerA" alt="" decoding="async" />
+    <img class="layer" id="layerB" alt="" decoding="async" />
+  </div>
+  <div id="message">Drop images into the <code>wallpapers/</code> folder, then refresh.</div>
+
+<script type="module">
+const WEEK_SECONDS = 7 * 24 * 60 * 60;
+const REFRESH_MS = 5 * 60 * 1000;   // re-poll the folder listing
+const FADE_MS = 900;                // must match CSS transition
+
+const layers = [document.getElementById("layerA"), document.getElementById("layerB")];
+const message = document.getElementById("message");
+
+let front = 0;              // index into layers[] currently visible
+let images = [];            // filenames, natural-sorted (server order)
+let clockOffset = 0;        // serverTime - Date.now() at last sync
+let currentIndex = null;    // image index currently shown
+let peekIndex = null;       // manual override via arrow keys
+let timer = null;
+
+const now = () => Date.now() + clockOffset;
+const src = (name) => "/wallpapers/" + encodeURIComponent(name);
+
+// --- weekly shuffle -------------------------------------------------------
+//
+// Each image is shown exactly once per week. Which image plays in which slot
+// is a deterministic shuffle keyed by the week number, so every device shows
+// the same order without any server-side state, and the order changes from
+// week to week instead of always repeating the same file order.
+
+// Small, fast 32-bit PRNG (mulberry32).
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Spread a small sequential integer (the week number) across the full 32-bit
+// range before feeding it to the PRNG, so consecutive weeks don't produce
+// visibly-related shuffles.
+function hashSeed(n) {
+  n = (n ^ 0xdeadbeef) >>> 0;
+  n = Math.imul(n ^ (n >>> 16), 2654435761);
+  n = Math.imul(n ^ (n >>> 13), 2246822519);
+  n ^= n >>> 16;
+  return n >>> 0;
+}
+
+function shuffledOrder(weekIndex, n) {
+  const order = Array.from({ length: n }, (_, i) => i);
+  const rand = mulberry32(hashSeed(weekIndex));
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  return order;
+}
+
+let weekOrderCache = { weekIndex: null, n: null, order: null };
+function weekOrder(weekIndex) {
+  if (weekOrderCache.weekIndex === weekIndex && weekOrderCache.n === images.length) {
+    return weekOrderCache.order;
+  }
+  const order = shuffledOrder(weekIndex, images.length);
+  weekOrderCache = { weekIndex, n: images.length, order };
+  return order;
+}
+
+// Which image is showing at `atMs`, and what comes right after it (for
+// preloading), which may fall in the following week's shuffled order.
+function slotInfo(atMs = now()) {
+  const weekMs = WEEK_SECONDS * 1000;
+  const weekIndex = Math.floor(atMs / weekMs);
+  const slotMs = weekMs / images.length;
+  const posInWeek = atMs - weekIndex * weekMs;
+  const slotPos = Math.min(images.length - 1, Math.floor(posInWeek / slotMs));
+  const imageIndex = weekOrder(weekIndex)[slotPos];
+  const msToNext = slotMs - (posInWeek % slotMs);
+  const nextImageIndex =
+    slotPos + 1 < images.length ? weekOrder(weekIndex)[slotPos + 1] : weekOrder(weekIndex + 1)[0];
+  return { imageIndex, msToNext, nextImageIndex };
+}
+
+function preload(name) {
+  if (!name) return;
+  const img = new Image();
+  img.decoding = "async";
+  img.src = src(name);
+}
+
+// Put `name` on the hidden layer, decode it, then cross-fade. `instant` skips
+// the fade for the very first paint. `preloadIndex`, when given, is warmed
+// for the next scheduled transition (may not be `index + 1` once shuffled).
+async function showImage(index, { instant = false, preloadIndex = null } = {}) {
+  if (index == null || !images[index]) return;
+  currentIndex = index;
+
+  const name = images[index];
+  const incoming = layers[1 - front];
+  const outgoing = layers[front];
+
+  incoming.src = src(name);
+  incoming.fetchPriority = "high";
+  try {
+    await incoming.decode();
+  } catch {
+    // decode() can reject on some formats/browsers; fall through and show anyway
+  }
+
+  if (instant) {
+    incoming.style.transition = "none";
+    incoming.classList.add("visible");
+    outgoing.classList.remove("visible");
+    void incoming.offsetWidth;               // flush
+    incoming.style.transition = "";
+  } else {
+    incoming.classList.add("visible");
+    outgoing.classList.remove("visible");
+  }
+  front = 1 - front;
+
+  if (preloadIndex != null) preload(images[preloadIndex]);
+}
+
+function scheduleNext() {
+  clearTimeout(timer);
+  if (!images.length) return;
+  const { msToNext } = slotInfo();
+  timer = setTimeout(onBoundary, msToNext + 50);
+}
+
+function onBoundary() {
+  peekIndex = null;
+  const { imageIndex, nextImageIndex } = slotInfo();
+  showImage(imageIndex, { preloadIndex: nextImageIndex });
+  scheduleNext();
+}
+
+// Render whatever should be on screen right now (scheduled image, unless the
+// user is peeking).
+function renderCurrent(instant = false) {
+  if (!images.length) {
+    message.classList.add("on");
+    clearTimeout(timer);
+    return;
+  }
+  message.classList.remove("on");
+  const { imageIndex, nextImageIndex } = slotInfo();
+  const idx = peekIndex != null ? peekIndex : imageIndex;
+  if (idx !== currentIndex || instant) showImage(idx, { instant, preloadIndex: nextImageIndex });
+  scheduleNext();
+}
+
+async function sync({ firstRun = false } = {}) {
+  let data;
+  try {
+    const res = await fetch("/api/wallpapers", { cache: "no-store" });
+    data = await res.json();
+  } catch {
+    if (firstRun) message.textContent = "Can't reach the server.";
+    if (firstRun) message.classList.add("on");
+    return;
+  }
+
+  clockOffset = data.serverTime - Date.now();
+
+  const changed =
+    data.images.length !== images.length ||
+    data.images.some((n, i) => n !== images[i]);
+  images = data.images;
+
+  if (firstRun) {
+    renderCurrent(true);
+  } else if (changed) {
+    // folder contents moved; the slot math changed with the count
+    if (peekIndex != null && peekIndex >= images.length) peekIndex = null;
+    renderCurrent(false);
+  } else {
+    scheduleNext();
+  }
+}
+
+// --- interaction ---------------------------------------------------------
+
+let cursorTimer = null;
+function pokeCursor() {
+  document.body.classList.add("show-cursor");
+  clearTimeout(cursorTimer);
+  cursorTimer = setTimeout(() => document.body.classList.remove("show-cursor"), 2000);
+}
+window.addEventListener("mousemove", pokeCursor, { passive: true });
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "f" || e.key === "F") {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.();
+  } else if (e.key === "ArrowRight") {
+    if (!images.length) return;
+    peekIndex = ((peekIndex ?? currentIndex ?? 0) + 1) % images.length;
+    showImage(peekIndex);
+  } else if (e.key === "ArrowLeft") {
+    if (!images.length) return;
+    const base = peekIndex ?? currentIndex ?? 0;
+    peekIndex = (base - 1 + images.length) % images.length;
+    showImage(peekIndex);
+  } else if (e.key === "Escape") {
+    peekIndex = null;
+    renderCurrent(false);
+  }
+});
+
+// Tab was hidden/asleep, or window regained focus: recompute the slot.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) renderCurrent(false);
+});
+window.addEventListener("focus", () => renderCurrent(false));
+
+// --- go ----------------------------------------------------------------
+
+sync({ firstRun: true });
+setInterval(() => sync(), REFRESH_MS);
+</script>
+</body>
+</html>
