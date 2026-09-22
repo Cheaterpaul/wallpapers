@@ -4,21 +4,50 @@ A single-purpose webpage that shows a wallpaper, full screen, at native quality.
 
 ## Run
 
+Wallpapers live in an S3-compatible bucket (MinIO, Garage, AWS, ...). Put the
+credentials in `.env` (gitignored):
+
 ```sh
-node server.mjs
+S3_URL=https://s3.example.com
+BUCKET=wallpaper
+ACCESS_KEY=...
+SECRET_KEY=...
 ```
 
-Then open <http://localhost:8080>. Put images in `wallpapers/` (see
-`wallpapers/README.md`).
+```sh
+node --env-file-if-exists=.env server.mjs   # or ./start.sh
+```
 
-No dependencies — plain Node (tested on v26). Nothing to install.
+Then open <http://localhost:8951>.
+
+No dependencies — plain Node (tested on v26). Nothing to install; S3 requests
+are signed with SigV4 using `node:crypto`.
+
+### Docker
+
+```sh
+docker build -t wallp .
+docker run --env-file .env -p 8951:8951 wallp
+```
+
+The GitHub Action in `.github/workflows/docker.yml` builds a multi-arch image
+(amd64/arm64) and pushes it to `ghcr.io/<owner>/<repo>` on pushes to `main` and
+`v*` tags; pull requests only build.
 
 ## Config (env vars)
 
-| var             | default        | meaning                                   |
-| --------------- | -------------- | ----------------------------------------- |
-| `PORT`          | `8080`         | listen port                               |
-| `WALLPAPER_DIR` | `./wallpapers` | folder to scan                            |
+| var          | default      | meaning                                          |
+| ------------ | ------------ | ------------------------------------------------ |
+| `PORT`       | `8951`       | listen port                                      |
+| `S3_URL`     | —            | S3 endpoint (path-style addressing)              |
+| `BUCKET`     | —            | bucket name                                      |
+| `ACCESS_KEY` | —            | access key id                                    |
+| `SECRET_KEY` | —            | secret access key                                |
+| `S3_REGION`  | `us-east-1`  | SigV4 signing region                             |
+| `S3_PREFIX`  | *(root)*     | "folder" inside the bucket to scan               |
+| `LIST_TTL`   | `60`         | seconds to cache the bucket listing              |
+
+Only objects directly under the prefix with an image extension are shown.
 
 ## How the wallpaper is chosen
 
@@ -57,7 +86,7 @@ The cursor hides after 2s of no movement.
 
 - `GET /` — the page
 - `GET /api/wallpapers` — `{ images, count, serverTime, slotSeconds }`
-- `GET /wallpapers/<file>` — the raw image (ETag, `Range`, no re-encoding)
+- `GET /wallpapers/<file>` — the raw image, proxied from S3 (ETag, `Range`, no re-encoding)
 
 ## Making it look even better
 
@@ -78,7 +107,7 @@ honours EXIF orientation. Bigger wins from here, roughly in order:
 5. **Service worker** cache-first for `wallpapers/*`, pre-caching upcoming slots
    so transitions never touch the network.
 6. **Content-hashed filenames** → `Cache-Control: immutable` and no revalidation.
-7. **`fs.watch` + SSE** to push folder changes instantly instead of the 5-min
+7. **Bucket notifications + SSE** to push bucket changes instantly instead of the 5-min
    poll; HTTP/2 via `node:http2` or a Caddy front.
 8. **Predictable schedule.** Align slot 0 to Monday 00:00 in a chosen timezone
    instead of the Unix epoch week boundary.

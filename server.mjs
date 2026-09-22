@@ -1,28 +1,52 @@
 // Zero-dependency wallpaper server.
 //
-// Serves index.html, a JSON listing of the wallpapers/ folder, and the raw
-// image files themselves (with ETag / Range support). No npm install needed.
+// Serves index.html, a JSON listing of the wallpapers in an S3 bucket, and the
+// raw image files themselves (proxied from S3, with ETag / Range support). No
+// npm install needed — requests are signed with AWS SigV4 via node:crypto.
 //
-//   node server.mjs
+//   node --env-file-if-exists=.env server.mjs
 //
 // Config via env vars:
-//   PORT           listen port                (default 8080)
-//   WALLPAPER_DIR  folder to scan for images  (default ./wallpapers)
+//   PORT        listen port                                (default 8951)
+//   S3_URL      S3 endpoint, e.g. https://s3.example.com   (required)
+//   BUCKET      bucket name                                (required)
+//   ACCESS_KEY  access key id                              (required)
+//   SECRET_KEY  secret access key                          (required)
+//   S3_REGION   signing region                             (default us-east-1)
+//   S3_PREFIX   key prefix ("folder") inside the bucket    (default: bucket root)
+//   LIST_TTL    seconds to cache the bucket listing        (default 60)
 //
 // Each image is shown exactly once per week; the order is reshuffled every
 // week using the week number as a seed (see index.html for the client-side
 // scheduling math).
 
 import http from "node:http";
-import { createReadStream } from "node:fs";
-import { readFile, readdir, stat } from "node:fs/promises";
+import { createHash, createHmac } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT) || 8951;
-const WALLPAPER_DIR = path.resolve(HERE, process.env.WALLPAPER_DIR || "wallpapers");
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
+
+const S3 = {
+  endpoint: (process.env.S3_URL || "").replace(/\/+$/, ""),
+  bucket: process.env.BUCKET || "",
+  accessKey: process.env.ACCESS_KEY || "",
+  secretKey: process.env.SECRET_KEY || "",
+  region: process.env.S3_REGION || "us-east-1",
+  prefix: (process.env.S3_PREFIX || "").replace(/^\/+|\/+$/g, ""),
+};
+if (S3.prefix) S3.prefix += "/";
+const LIST_TTL_MS = (Number(process.env.LIST_TTL) || 60) * 1000;
+
+const missing = ["S3_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY"].filter((k) => !process.env[k]);
+if (missing.length) {
+  console.error(`missing required env vars: ${missing.join(", ")}`);
+  process.exit(1);
+}
 
 const IMAGE_EXT = new Set([
   ".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp", ".jxl",
@@ -50,27 +74,114 @@ function naturalSort(a, b) {
   return collator.compare(a, b);
 }
 
-// Join a user-supplied name onto dir, refusing anything that escapes it.
-function safeJoin(dir, name) {
-  const decoded = decodeURIComponent(name);
-  const full = path.resolve(dir, "." + path.sep + decoded);
-  const rel = path.relative(dir, full);
-  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  return full;
+// ---------------------------------------------------------------------------
+// Minimal S3 client (path-style addressing, AWS Signature Version 4).
+
+const sha256Hex = (data) => createHash("sha256").update(data).digest("hex");
+const hmac = (key, data) => createHmac("sha256", key).update(data).digest();
+const EMPTY_SHA256 = sha256Hex("");
+
+// RFC 3986 encoding as SigV4 expects it (encodeURIComponent leaves !'()* alone).
+function uriEncode(str) {
+  return encodeURIComponent(str).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
-async function listWallpapers() {
-  let entries;
-  try {
-    entries = await readdir(WALLPAPER_DIR, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  return entries
-    .filter((e) => (e.isFile() || e.isSymbolicLink()) && IMAGE_EXT.has(path.extname(e.name).toLowerCase()))
-    .map((e) => e.name)
-    .sort(naturalSort);
+// Signed fetch against `/<bucket>/<key>` with the given query params.
+async function s3Fetch(key, query = {}, { headers = {}, signal } = {}) {
+  const base = new URL(S3.endpoint);
+  const basePath = base.pathname.replace(/\/+$/, "");
+  const canonicalUri =
+    basePath + "/" + [S3.bucket, ...(key ? key.split("/") : [])].map(uriEncode).join("/");
+  const canonicalQuery = Object.keys(query)
+    .sort()
+    .map((k) => `${uriEncode(k)}=${uriEncode(String(query[k]))}`)
+    .join("&");
+
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const scope = `${dateStamp}/${S3.region}/s3/aws4_request`;
+
+  const signed = { host: base.host, "x-amz-content-sha256": EMPTY_SHA256, "x-amz-date": amzDate };
+  const signedNames = Object.keys(signed).sort();
+  const canonicalRequest = [
+    "GET",
+    canonicalUri,
+    canonicalQuery,
+    signedNames.map((h) => `${h}:${signed[h]}\n`).join(""),
+    signedNames.join(";"),
+    EMPTY_SHA256,
+  ].join("\n");
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
+
+  let k = hmac("AWS4" + S3.secretKey, dateStamp);
+  k = hmac(k, S3.region);
+  k = hmac(k, "s3");
+  k = hmac(k, "aws4_request");
+  const signature = createHmac("sha256", k).update(stringToSign).digest("hex");
+
+  const url = `${base.origin}${canonicalUri}${canonicalQuery ? "?" + canonicalQuery : ""}`;
+  return fetch(url, {
+    headers: {
+      ...headers,
+      "x-amz-content-sha256": EMPTY_SHA256,
+      "x-amz-date": amzDate,
+      Authorization:
+        `AWS4-HMAC-SHA256 Credential=${S3.accessKey}/${scope}, ` +
+        `SignedHeaders=${signedNames.join(";")}, Signature=${signature}`,
+    },
+    signal,
+  });
 }
+
+function xmlDecode(s) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (_, e) => {
+    if (e[0] === "#") return String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1)));
+    return { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" }[e.toLowerCase()];
+  });
+}
+
+// All object keys directly under S3.prefix (non-recursive, like the old readdir).
+async function listObjects() {
+  const keys = [];
+  let token;
+  do {
+    const query = { "list-type": "2", delimiter: "/", prefix: S3.prefix };
+    if (token) query["continuation-token"] = token;
+    const res = await s3Fetch("", query);
+    const xml = await res.text();
+    if (!res.ok) throw new Error(`S3 list failed: ${res.status} ${xml.slice(0, 300)}`);
+    for (const m of xml.matchAll(/<Contents>[\s\S]*?<Key>([\s\S]*?)<\/Key>[\s\S]*?<\/Contents>/g)) {
+      keys.push(xmlDecode(m[1]));
+    }
+    const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
+    token = truncated ? xmlDecode(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml)?.[1] ?? "") : null;
+  } while (token);
+  return keys;
+}
+
+// Cached listing so every client poll doesn't hit the bucket.
+let listCache = { at: 0, images: [], pending: null };
+
+async function listWallpapers() {
+  if (Date.now() - listCache.at < LIST_TTL_MS) return listCache.images;
+  listCache.pending ??= listObjects()
+    .then((keys) => {
+      const images = keys
+        .map((k) => k.slice(S3.prefix.length))
+        .filter((n) => n && IMAGE_EXT.has(path.extname(n).toLowerCase()))
+        .sort(naturalSort);
+      listCache = { at: Date.now(), images, pending: null };
+      return images;
+    })
+    .catch((err) => {
+      console.error(err.message);
+      listCache.pending = null;
+      return listCache.images; // serve the last good listing on failure
+    });
+  return listCache.pending;
+}
+
+// ---------------------------------------------------------------------------
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -113,66 +224,58 @@ async function serveApi(res) {
   });
 }
 
-async function serveImage(req, res, name) {
-  const full = safeJoin(WALLPAPER_DIR, name);
-  if (!full) return notFound(res, "Bad path");
-
-  let info;
+// Proxy an image from S3, passing Range / conditional headers straight through.
+async function serveImage(req, res, rawName) {
+  let name;
   try {
-    info = await stat(full);
+    name = decodeURIComponent(rawName);
   } catch {
-    return notFound(res);
+    return notFound(res, "Bad path");
   }
-  if (!info.isFile()) return notFound(res);
+  if (!name || name.includes("/") || name.includes("\\")) return notFound(res, "Bad path");
 
-  const ext = path.extname(full).toLowerCase();
+  const ext = path.extname(name).toLowerCase();
   if (!IMAGE_EXT.has(ext)) return notFound(res);
 
-  const etag = `"${info.mtimeMs.toString(36)}-${info.size.toString(36)}"`;
-  const baseHeaders = {
+  const fwd = {};
+  for (const h of ["range", "if-none-match", "if-modified-since"]) {
+    if (req.headers[h]) fwd[h] = req.headers[h];
+  }
+
+  const abort = new AbortController();
+  res.on("close", () => abort.abort());
+
+  const upstream = await s3Fetch(S3.prefix + name, {}, { headers: fwd, signal: abort.signal });
+
+  if (upstream.status === 404 || upstream.status === 403) {
+    await upstream.body?.cancel();
+    return notFound(res);
+  }
+  if (![200, 206, 304, 416].includes(upstream.status)) {
+    const text = await upstream.text();
+    console.error(`S3 GET ${name} failed: ${upstream.status} ${text.slice(0, 300)}`);
+    res.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("Upstream error");
+  }
+
+  const headers = {
     "Content-Type": contentType(ext),
     "Cache-Control": "public, max-age=300",
     "Accept-Ranges": "bytes",
-    ETag: etag,
-    "Last-Modified": info.mtime.toUTCString(),
   };
+  for (const h of ["content-length", "content-range", "etag", "last-modified"]) {
+    const v = upstream.headers.get(h);
+    if (v) headers[h] = v;
+  }
 
-  if (req.headers["if-none-match"] === etag) {
-    res.writeHead(304, baseHeaders);
+  res.writeHead(upstream.status, headers);
+  if (req.method === "HEAD" || !upstream.body || upstream.status === 304) {
+    await upstream.body?.cancel();
     return res.end();
   }
-
-  // Range support for large images.
-  const range = req.headers.range;
-  if (range) {
-    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
-    if (m) {
-      let start = m[1] === "" ? null : Number(m[1]);
-      let end = m[2] === "" ? null : Number(m[2]);
-      if (start === null) {
-        // suffix range: last N bytes
-        start = Math.max(0, info.size - (end ?? 0));
-        end = info.size - 1;
-      } else if (end === null || end >= info.size) {
-        end = info.size - 1;
-      }
-      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= info.size) {
-        res.writeHead(416, { ...baseHeaders, "Content-Range": `bytes */${info.size}` });
-        return res.end();
-      }
-      res.writeHead(206, {
-        ...baseHeaders,
-        "Content-Range": `bytes ${start}-${end}/${info.size}`,
-        "Content-Length": end - start + 1,
-      });
-      if (req.method === "HEAD") return res.end();
-      return createReadStream(full, { start, end }).pipe(res);
-    }
-  }
-
-  res.writeHead(200, { ...baseHeaders, "Content-Length": info.size });
-  if (req.method === "HEAD") return res.end();
-  createReadStream(full).pipe(res);
+  Readable.fromWeb(upstream.body)
+    .on("error", () => res.destroy())
+    .pipe(res);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -185,31 +288,34 @@ const server = http.createServer(async (req, res) => {
       return res.end("Method not allowed");
     }
 
-    if (pathname === "/" || pathname === "/index.html") return serveIndex(res);
-    if (pathname === "/api/wallpapers") return serveApi(res);
+    if (pathname === "/" || pathname === "/index.html") return await serveIndex(res);
+    if (pathname === "/api/wallpapers") return await serveApi(res);
     if (pathname.startsWith("/wallpapers/")) {
-      return serveImage(req, res, pathname.slice("/wallpapers/".length));
+      return await serveImage(req, res, pathname.slice("/wallpapers/".length));
     }
     if (pathname === "/favicon.ico") return notFound(res);
 
     notFound(res);
   } catch (err) {
+    if (err.name === "AbortError") return;
     console.error(err);
     if (!res.headersSent) res.writeHead(500);
     res.end("Server error");
   }
 });
 
+for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0));
+
 server.listen(PORT, async () => {
   const images = await listWallpapers();
   const slot = images.length ? WEEK_SECONDS / images.length : null;
   console.log(`wallp -> http://localhost:${PORT}`);
-  console.log(`  folder : ${WALLPAPER_DIR}`);
+  console.log(`  bucket : ${S3.endpoint}/${S3.bucket}/${S3.prefix}`);
   console.log(`  images : ${images.length}`);
   if (slot) {
     const mins = Math.round(slot / 60);
     console.log(`  slot   : ${mins} min  (each image 1x / week, reshuffled weekly)`);
   } else {
-    console.log(`  slot   : n/a  (drop images into the folder)`);
+    console.log(`  slot   : n/a  (upload images to the bucket)`);
   }
 });

@@ -24,7 +24,7 @@ if is_running; then
 	echo "wallp already running on ${URL}"
 else
 	echo "starting wallp on ${URL}"
-	PORT="${PORT}" node server.mjs &
+	PORT="${PORT}" node --env-file-if-exists=.env server.mjs &
 	# Wait for the port to come up (max ~10s).
 	i=0
 	while ! is_running; do
