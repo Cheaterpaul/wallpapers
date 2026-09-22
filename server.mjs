@@ -260,7 +260,7 @@ async function serveImage(req, res, rawName) {
 
   const headers = {
     "Content-Type": contentType(ext),
-    "Cache-Control": "public, max-age=300",
+    "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
     "Accept-Ranges": "bytes",
   };
   for (const h of ["content-length", "content-range", "etag", "last-modified"]) {

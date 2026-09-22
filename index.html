@@ -58,7 +58,7 @@
     <img class="layer" id="layerA" alt="" decoding="async" />
     <img class="layer" id="layerB" alt="" decoding="async" />
   </div>
-  <div id="message">Drop images into the <code>wallpapers/</code> folder, then refresh.</div>
+  <div id="message">No wallpapers found — upload images to the S3 bucket.</div>
 
 <script type="module">
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
@@ -143,19 +143,45 @@ function slotInfo(atMs = now()) {
   return { imageIndex, msToNext, nextImageIndex };
 }
 
+// Decoded images kept alive so the next transition paints instantly. Holding
+// the Image objects stops the browser from evicting them from its memory cache.
+const warmCache = new Map();   // name -> HTMLImageElement
+
 function preload(name) {
-  if (!name) return;
+  if (!name || warmCache.has(name)) return;
   const img = new Image();
   img.decoding = "async";
+  img.fetchPriority = "low";
   img.src = src(name);
+  img.decode().catch(() => {});
+  warmCache.set(name, img);
 }
 
+// Warm the neighbours of `index`: previous / next (arrow keys) and the next
+// scheduled image. Everything else is dropped to bound memory use.
+function preloadAround(index) {
+  if (!images.length) return;
+  const n = images.length;
+  const keep = [
+    images[index],
+    images[(index + 1) % n],
+    images[(index - 1 + n) % n],
+    images[slotInfo().nextImageIndex],
+  ];
+  for (const name of warmCache.keys()) {
+    if (!keep.includes(name)) warmCache.delete(name);
+  }
+  keep.forEach(preload);
+}
+
+let showSeq = 0;
+
 // Put `name` on the hidden layer, decode it, then cross-fade. `instant` skips
-// the fade for the very first paint. `preloadIndex`, when given, is warmed
-// for the next scheduled transition (may not be `index + 1` once shuffled).
-async function showImage(index, { instant = false, preloadIndex = null } = {}) {
+// the fade for the very first paint.
+async function showImage(index, { instant = false } = {}) {
   if (index == null || !images[index]) return;
   currentIndex = index;
+  const seq = ++showSeq;
 
   const name = images[index];
   const incoming = layers[1 - front];
@@ -168,6 +194,8 @@ async function showImage(index, { instant = false, preloadIndex = null } = {}) {
   } catch {
     // decode() can reject on some formats/browsers; fall through and show anyway
   }
+  // A newer showImage() (e.g. fast arrow presses) took over this layer.
+  if (seq !== showSeq) return;
 
   if (instant) {
     incoming.style.transition = "none";
@@ -181,7 +209,7 @@ async function showImage(index, { instant = false, preloadIndex = null } = {}) {
   }
   front = 1 - front;
 
-  if (preloadIndex != null) preload(images[preloadIndex]);
+  preloadAround(index);
 }
 
 function scheduleNext() {
@@ -193,8 +221,7 @@ function scheduleNext() {
 
 function onBoundary() {
   peekIndex = null;
-  const { imageIndex, nextImageIndex } = slotInfo();
-  showImage(imageIndex, { preloadIndex: nextImageIndex });
+  showImage(slotInfo().imageIndex);
   scheduleNext();
 }
 
@@ -207,9 +234,8 @@ function renderCurrent(instant = false) {
     return;
   }
   message.classList.remove("on");
-  const { imageIndex, nextImageIndex } = slotInfo();
-  const idx = peekIndex != null ? peekIndex : imageIndex;
-  if (idx !== currentIndex || instant) showImage(idx, { instant, preloadIndex: nextImageIndex });
+  const idx = peekIndex != null ? peekIndex : slotInfo().imageIndex;
+  if (idx !== currentIndex || instant) showImage(idx, { instant });
   scheduleNext();
 }
 
