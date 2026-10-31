@@ -87,6 +87,10 @@ The cursor hides after 2s of no movement.
 - `GET /` — the page
 - `GET /api/wallpapers` — `{ images, count, serverTime, slotSeconds }`
 - `GET /wallpapers/<file>` — the raw image, proxied from S3 (ETag, `Range`, no re-encoding)
+- `GET /current` — the image scheduled right now, served directly (same bytes as
+  `/wallpapers/<file>`), so it works as a plain image URL for other tools.
+  `Cache-Control: max-age` lasts until the slot ends; the filename is in
+  `X-Wallpaper` and `Content-Disposition`.
 
 ## Making it look even better
 

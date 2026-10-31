@@ -18,7 +18,7 @@
 //
 // Each image is shown exactly once per week; the order is reshuffled every
 // week using the week number as a seed (see index.html for the client-side
-// scheduling math).
+// scheduling math, mirrored here for GET /current).
 
 import http from "node:http";
 import { createHash, createHmac } from "node:crypto";
@@ -182,6 +182,49 @@ async function listWallpapers() {
 }
 
 // ---------------------------------------------------------------------------
+// Weekly schedule — must stay identical to the copy in index.html.
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hashSeed(n) {
+  n = (n ^ 0xdeadbeef) >>> 0;
+  n = Math.imul(n ^ (n >>> 16), 2654435761);
+  n = Math.imul(n ^ (n >>> 13), 2246822519);
+  n ^= n >>> 16;
+  return n >>> 0;
+}
+
+function shuffledOrder(weekIndex, n) {
+  const order = Array.from({ length: n }, (_, i) => i);
+  const rand = mulberry32(hashSeed(weekIndex));
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  return order;
+}
+
+// The scheduled image at `atMs`, plus ms until it changes.
+function currentSlot(images, atMs = Date.now()) {
+  const weekMs = WEEK_SECONDS * 1000;
+  const weekIndex = Math.floor(atMs / weekMs);
+  const slotMs = weekMs / images.length;
+  const posInWeek = atMs - weekIndex * weekMs;
+  const slotPos = Math.min(images.length - 1, Math.floor(posInWeek / slotMs));
+  const name = images[shuffledOrder(weekIndex, images.length)[slotPos]];
+  return { name, msToNext: slotMs - (posInWeek % slotMs) };
+}
+
+// ---------------------------------------------------------------------------
 
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -224,6 +267,19 @@ async function serveApi(res) {
   });
 }
 
+// The image scheduled right now, served directly (no redirect) so it can be
+// used as a plain image URL. Cacheable only until the slot ends.
+async function serveCurrent(req, res) {
+  const images = await listWallpapers();
+  if (!images.length) return notFound(res, "No wallpapers");
+  const { name, msToNext } = currentSlot(images);
+  return serveImageNamed(req, res, name, {
+    "Cache-Control": `public, max-age=${Math.max(0, Math.floor(msToNext / 1000))}`,
+    "Content-Disposition": `inline; filename*=UTF-8''${uriEncode(name)}`,
+    "X-Wallpaper": uriEncode(name),
+  });
+}
+
 // Proxy an image from S3, passing Range / conditional headers straight through.
 async function serveImage(req, res, rawName) {
   let name;
@@ -233,7 +289,10 @@ async function serveImage(req, res, rawName) {
     return notFound(res, "Bad path");
   }
   if (!name || name.includes("/") || name.includes("\\")) return notFound(res, "Bad path");
+  return serveImageNamed(req, res, name);
+}
 
+async function serveImageNamed(req, res, name, extraHeaders = {}) {
   const ext = path.extname(name).toLowerCase();
   if (!IMAGE_EXT.has(ext)) return notFound(res);
 
@@ -262,6 +321,7 @@ async function serveImage(req, res, rawName) {
     "Content-Type": contentType(ext),
     "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
     "Accept-Ranges": "bytes",
+    ...extraHeaders,
   };
   for (const h of ["content-length", "content-range", "etag", "last-modified"]) {
     const v = upstream.headers.get(h);
@@ -290,6 +350,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/" || pathname === "/index.html") return await serveIndex(res);
     if (pathname === "/api/wallpapers") return await serveApi(res);
+    if (pathname === "/current") return await serveCurrent(req, res);
     if (pathname.startsWith("/wallpapers/")) {
       return await serveImage(req, res, pathname.slice("/wallpapers/".length));
     }
