@@ -275,9 +275,25 @@ async function serveCurrent(req, res) {
   const { name, msToNext } = currentSlot(images);
   return serveImageNamed(req, res, name, {
     "Cache-Control": `public, max-age=${Math.max(0, Math.floor(msToNext / 1000))}`,
+    ...nameHeaders(name),
+  });
+}
+
+// A different random image on every request; never cached.
+async function serveRandom(req, res) {
+  const images = await listWallpapers();
+  if (!images.length) return notFound(res, "No wallpapers");
+  const name = images[Math.floor(Math.random() * images.length)];
+  // Strip conditional/range headers: they'd refer to a previous random pick.
+  for (const h of ["range", "if-none-match", "if-modified-since"]) delete req.headers[h];
+  return serveImageNamed(req, res, name, { "Cache-Control": "no-store", ...nameHeaders(name) });
+}
+
+function nameHeaders(name) {
+  return {
     "Content-Disposition": `inline; filename*=UTF-8''${uriEncode(name)}`,
     "X-Wallpaper": uriEncode(name),
-  });
+  };
 }
 
 // Proxy an image from S3, passing Range / conditional headers straight through.
@@ -351,6 +367,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/" || pathname === "/index.html") return await serveIndex(res);
     if (pathname === "/api/wallpapers") return await serveApi(res);
     if (pathname === "/current") return await serveCurrent(req, res);
+    if (pathname === "/random") return await serveRandom(req, res);
     if (pathname.startsWith("/wallpapers/")) {
       return await serveImage(req, res, pathname.slice("/wallpapers/".length));
     }

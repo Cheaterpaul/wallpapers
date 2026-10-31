@@ -91,6 +91,8 @@ The cursor hides after 2s of no movement.
   `/wallpapers/<file>`), so it works as a plain image URL for other tools.
   `Cache-Control: max-age` lasts until the slot ends; the filename is in
   `X-Wallpaper` and `Content-Disposition`.
+- `GET /random` — a random image on every request (`Cache-Control: no-store`),
+  same headers otherwise.
 
 ## Making it look even better
 
