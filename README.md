@@ -56,8 +56,11 @@ docker run -d --restart unless-stopped --env-file .env -p 8951:8951 \
   ghcr.io/cheaterpaul/wallpapers:latest
 ```
 
-`latest` follows the `main` branch. Each commit also gets its own `sha-<commit>`
-tag, and `v*` git tags are published as version tags.
+| image tag       | contents                                   |
+| --------------- | ------------------------------------------ |
+| `latest`        | the most recent release                    |
+| `v1.2.3`        | a specific release, named after its git tag |
+| `bleeding-edge` | the newest commit on `main`, unreleased    |
 
 To build the image yourself instead:
 
