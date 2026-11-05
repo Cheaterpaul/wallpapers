@@ -85,6 +85,7 @@ The cursor hides after 2s of no movement.
 ## Endpoints
 
 - `GET /` — the page
+- `GET /favicon.svg` — the page icon, embedded in `server.mjs` (also served at `/favicon.ico`)
 - `GET /api/wallpapers` — `{ images, count, serverTime, slotSeconds }`
 - `GET /wallpapers/<file>` — the raw image, proxied from S3 (ETag, `Range`, no re-encoding)
 - `GET /current` — the image scheduled right now, served directly (same bytes as

@@ -255,6 +255,22 @@ async function serveIndex(res) {
   }
 }
 
+// A tiny landscape picture: sun over two hills.
+const FAVICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<rect width="32" height="32" rx="6" fill="#1e2a44"/>
+<circle cx="22" cy="10" r="4" fill="#ffc857"/>
+<path d="M0 26 11 12l8 10 4-4 9 9v1a4 4 0 0 1-4 4H4a4 4 0 0 1-4-4z" fill="#5fb49c"/>
+</svg>`;
+
+function serveFavicon(res) {
+  res.writeHead(200, {
+    "Content-Type": "image/svg+xml",
+    "Content-Length": Buffer.byteLength(FAVICON),
+    "Cache-Control": "public, max-age=86400",
+  });
+  res.end(FAVICON);
+}
+
 async function serveApi(res) {
   const images = await listWallpapers();
   const count = images.length;
@@ -382,7 +398,7 @@ const server = http.createServer(async (req, res) => {
     if (pathname.startsWith("/wallpapers/")) {
       return await serveImage(req, res, pathname.slice("/wallpapers/".length));
     }
-    if (pathname === "/favicon.ico") return notFound(res);
+    if (pathname === "/favicon.svg" || pathname === "/favicon.ico") return serveFavicon(res);
 
     notFound(res);
   } catch (err) {
