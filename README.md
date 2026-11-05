@@ -90,7 +90,9 @@ The cursor hides after 2s of no movement.
 - `GET /current` — the image scheduled right now, served directly (same bytes as
   `/wallpapers/<file>`), so it works as a plain image URL for other tools.
   `Cache-Control: max-age` lasts until the slot ends; the filename is in
-  `X-Wallpaper` and `Content-Disposition`.
+  `X-Wallpaper` and `Content-Disposition`. `?add=N` returns the image `N` steps
+  from the scheduled one, the same as pressing `→` `N` times in the page
+  (negative `N` for `←`); it wraps around the sorted image list.
 - `GET /random` — a random image on every request (`Cache-Control: no-store`),
   same headers otherwise.
 

@@ -220,8 +220,8 @@ function currentSlot(images, atMs = Date.now()) {
   const slotMs = weekMs / images.length;
   const posInWeek = atMs - weekIndex * weekMs;
   const slotPos = Math.min(images.length - 1, Math.floor(posInWeek / slotMs));
-  const name = images[shuffledOrder(weekIndex, images.length)[slotPos]];
-  return { name, msToNext: slotMs - (posInWeek % slotMs) };
+  const imageIndex = shuffledOrder(weekIndex, images.length)[slotPos];
+  return { imageIndex, msToNext: slotMs - (posInWeek % slotMs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -269,10 +269,21 @@ async function serveApi(res) {
 
 // The image scheduled right now, served directly (no redirect) so it can be
 // used as a plain image URL. Cacheable only until the slot ends.
-async function serveCurrent(req, res) {
+//
+// `?add=N` steps N images away from the scheduled one, like pressing the arrow
+// keys in the page N times: it walks the sorted image list (wrapping around),
+// not the weekly shuffle order. Negative N steps backwards.
+async function serveCurrent(req, res, url) {
+  const add = Number(url.searchParams.get("add") ?? 0);
+  if (!Number.isSafeInteger(add)) {
+    res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    return res.end("add must be an integer");
+  }
   const images = await listWallpapers();
   if (!images.length) return notFound(res, "No wallpapers");
-  const { name, msToNext } = currentSlot(images);
+  const { imageIndex, msToNext } = currentSlot(images);
+  const n = images.length;
+  const name = images[(((imageIndex + (add % n)) % n) + n) % n];
   return serveImageNamed(req, res, name, {
     "Cache-Control": `public, max-age=${Math.max(0, Math.floor(msToNext / 1000))}`,
     ...nameHeaders(name),
@@ -366,7 +377,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/" || pathname === "/index.html") return await serveIndex(res);
     if (pathname === "/api/wallpapers") return await serveApi(res);
-    if (pathname === "/current") return await serveCurrent(req, res);
+    if (pathname === "/current") return await serveCurrent(req, res, url);
     if (pathname === "/random") return await serveRandom(req, res);
     if (pathname.startsWith("/wallpapers/")) {
       return await serveImage(req, res, pathname.slice("/wallpapers/".length));
