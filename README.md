@@ -47,14 +47,27 @@ Chromium. `./stop.sh` stops whatever is listening on `PORT`.
 
 ### Docker
 
+A ready-made image for amd64 and arm64 is published to the GitHub Container
+Registry, so you don't need to clone the repository. Create the `.env` file from
+step 1 above, then run:
+
 ```sh
-docker build -t wallp .
-docker run -d --restart unless-stopped --env-file .env -p 8951:8951 wallp
+docker run -d --restart unless-stopped --env-file .env -p 8951:8951 \
+  ghcr.io/cheaterpaul/wallpapers:latest
 ```
 
-The GitHub Action in `.github/workflows/docker.yml` builds a multi-arch image
-(amd64/arm64) and pushes it to `ghcr.io/<owner>/<repo>` on pushes to `main` and
-`v*` tags; pull requests only build.
+`latest` follows the `main` branch. Each commit also gets its own `sha-<commit>`
+tag, and `v*` git tags are published as version tags.
+
+To build the image yourself instead:
+
+```sh
+docker build -t wallpapers .
+docker run -d --restart unless-stopped --env-file .env -p 8951:8951 wallpapers
+```
+
+The image is built by the GitHub Action in `.github/workflows/docker.yml` on pushes
+to `main` and `v*` tags; pull requests only build it.
 
 ## Adding wallpapers
 
