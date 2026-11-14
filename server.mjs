@@ -15,6 +15,10 @@
 //   S3_REGION   signing region                             (default us-east-1)
 //   S3_PREFIX   key prefix ("folder") inside the bucket    (default: bucket root)
 //   LIST_TTL    seconds to cache the bucket listing        (default 60)
+//   TAG_TTL     seconds to cache each object's S3 tags      (default 3600)
+//
+// Images can be tagged from the page: `favorite=true` or `bad=true` (stored as
+// S3 object tags). Images tagged `bad` are left out of the rotation entirely.
 //
 // Each image is shown exactly once per week; the order is reshuffled every
 // week using the week number as a seed (see index.html for the client-side
@@ -41,6 +45,9 @@ const S3 = {
 };
 if (S3.prefix) S3.prefix += "/";
 const LIST_TTL_MS = (Number(process.env.LIST_TTL) || 60) * 1000;
+const TAG_TTL_MS = (Number(process.env.TAG_TTL) || 3600) * 1000;
+const TAG_FAVORITE = "favorite";
+const TAG_BAD = "bad";
 
 const missing = ["S3_URL", "BUCKET", "ACCESS_KEY", "SECRET_KEY"].filter((k) => !process.env[k]);
 if (missing.length) {
@@ -86,8 +93,9 @@ function uriEncode(str) {
   return encodeURIComponent(str).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
-// Signed fetch against `/<bucket>/<key>` with the given query params.
-async function s3Fetch(key, query = {}, { headers = {}, signal } = {}) {
+// Signed request against `/<bucket>/<key>` with the given query params.
+async function s3Fetch(key, query = {}, { method = "GET", body, headers = {}, signal } = {}) {
+  const payloadHash = body != null ? sha256Hex(body) : EMPTY_SHA256;
   const base = new URL(S3.endpoint);
   const basePath = base.pathname.replace(/\/+$/, "");
   const canonicalUri =
@@ -101,15 +109,15 @@ async function s3Fetch(key, query = {}, { headers = {}, signal } = {}) {
   const dateStamp = amzDate.slice(0, 8);
   const scope = `${dateStamp}/${S3.region}/s3/aws4_request`;
 
-  const signed = { host: base.host, "x-amz-content-sha256": EMPTY_SHA256, "x-amz-date": amzDate };
+  const signed = { host: base.host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate };
   const signedNames = Object.keys(signed).sort();
   const canonicalRequest = [
-    "GET",
+    method,
     canonicalUri,
     canonicalQuery,
     signedNames.map((h) => `${h}:${signed[h]}\n`).join(""),
     signedNames.join(";"),
-    EMPTY_SHA256,
+    payloadHash,
   ].join("\n");
   const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
 
@@ -121,9 +129,11 @@ async function s3Fetch(key, query = {}, { headers = {}, signal } = {}) {
 
   const url = `${base.origin}${canonicalUri}${canonicalQuery ? "?" + canonicalQuery : ""}`;
   return fetch(url, {
+    method,
+    body,
     headers: {
       ...headers,
-      "x-amz-content-sha256": EMPTY_SHA256,
+      "x-amz-content-sha256": payloadHash,
       "x-amz-date": amzDate,
       Authorization:
         `AWS4-HMAC-SHA256 Credential=${S3.accessKey}/${scope}, ` +
@@ -138,6 +148,10 @@ function xmlDecode(s) {
     if (e[0] === "#") return String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1)));
     return { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" }[e.toLowerCase()];
   });
+}
+
+function xmlEncode(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[c]);
 }
 
 // All object keys directly under S3.prefix (non-recursive, like the old readdir).
@@ -159,17 +173,84 @@ async function listObjects() {
   return keys;
 }
 
+// ---------------------------------------------------------------------------
+// Object tags (GET/PUT/DELETE ?tagging).
+
+async function getTags(name) {
+  const res = await s3Fetch(S3.prefix + name, { tagging: "" });
+  const xml = await res.text();
+  if (!res.ok) throw new Error(`S3 get tags ${name} failed: ${res.status} ${xml.slice(0, 300)}`);
+  const tags = {};
+  for (const [, inner] of xml.matchAll(/<Tag>([\s\S]*?)<\/Tag>/g)) {
+    const k = /<Key>([\s\S]*?)<\/Key>/.exec(inner)?.[1];
+    const v = /<Value>([\s\S]*?)<\/Value>/.exec(inner)?.[1] ?? "";
+    if (k != null) tags[xmlDecode(k)] = xmlDecode(v);
+  }
+  return tags;
+}
+
+async function putTags(name, tags) {
+  const entries = Object.entries(tags);
+  let res;
+  if (!entries.length) {
+    res = await s3Fetch(S3.prefix + name, { tagging: "" }, { method: "DELETE" });
+  } else {
+    const body =
+      "<Tagging><TagSet>" +
+      entries.map(([k, v]) => `<Tag><Key>${xmlEncode(k)}</Key><Value>${xmlEncode(v)}</Value></Tag>`).join("") +
+      "</TagSet></Tagging>";
+    res = await s3Fetch(S3.prefix + name, { tagging: "" }, {
+      method: "PUT",
+      body,
+      headers: {
+        "Content-Type": "application/xml",
+        "Content-MD5": createHash("md5").update(body).digest("base64"),
+      },
+    });
+  }
+  const text = await res.text();
+  if (!res.ok) throw new Error(`S3 put tags ${name} failed: ${res.status} ${text.slice(0, 300)}`);
+}
+
+// name -> { at, tags }. Tags change rarely and only through this server (or by
+// hand), so they're cached much longer than the listing.
+const tagCache = new Map();
+
+async function refreshTags(names) {
+  const stale = names.filter((n) => !(Date.now() - (tagCache.get(n)?.at ?? 0) < TAG_TTL_MS));
+  let i = 0;
+  const worker = async () => {
+    while (i < stale.length) {
+      const name = stale[i++];
+      try {
+        tagCache.set(name, { at: Date.now(), tags: await getTags(name) });
+      } catch (err) {
+        console.error(err.message); // keep the old entry (if any), retry next refresh
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: 16 }, worker));
+  const live = new Set(names);
+  for (const n of tagCache.keys()) if (!live.has(n)) tagCache.delete(n);
+}
+
+const tagsOf = (name) => tagCache.get(name)?.tags ?? {};
+const isBad = (name) => tagsOf(name)[TAG_BAD] === "true";
+const isFavorite = (name) => tagsOf(name)[TAG_FAVORITE] === "true";
+
 // Cached listing so every client poll doesn't hit the bucket.
 let listCache = { at: 0, images: [], pending: null };
 
-async function listWallpapers() {
+// Every image in the bucket (including ones tagged bad), with tags loaded.
+async function listAllImages() {
   if (Date.now() - listCache.at < LIST_TTL_MS) return listCache.images;
   listCache.pending ??= listObjects()
-    .then((keys) => {
+    .then(async (keys) => {
       const images = keys
         .map((k) => k.slice(S3.prefix.length))
         .filter((n) => n && IMAGE_EXT.has(path.extname(n).toLowerCase()))
         .sort(naturalSort);
+      await refreshTags(images);
       listCache = { at: Date.now(), images, pending: null };
       return images;
     })
@@ -179,6 +260,11 @@ async function listWallpapers() {
       return listCache.images; // serve the last good listing on failure
     });
   return listCache.pending;
+}
+
+// The images in rotation: everything not tagged bad.
+async function listWallpapers() {
+  return (await listAllImages()).filter((n) => !isBad(n));
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +363,7 @@ async function serveApi(res) {
   const slotSeconds = count > 0 ? WEEK_SECONDS / count : null;
   sendJson(res, 200, {
     images,
+    favorites: images.filter(isFavorite),
     count,
     serverTime: Date.now(),
     slotSeconds,
@@ -314,6 +401,52 @@ async function serveRandom(req, res) {
   // Strip conditional/range headers: they'd refer to a previous random pick.
   for (const h of ["range", "if-none-match", "if-modified-since"]) delete req.headers[h];
   return serveImageNamed(req, res, name, { "Cache-Control": "no-store", ...nameHeaders(name) });
+}
+
+// POST /api/wallpapers/<name>  {"favorite": bool} and/or {"bad": bool}
+// Sets or clears the tag, keeping any other tags on the object. Favorite and
+// bad are mutually exclusive: setting one clears the other.
+async function serveSetTags(req, res, rawName) {
+  let name;
+  try {
+    name = decodeURIComponent(rawName);
+  } catch {
+    return notFound(res, "Bad path");
+  }
+  if (!(await listAllImages()).includes(name)) return notFound(res);
+
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > 1024) return sendJson(res, 413, { error: "body too large" });
+  }
+  let want;
+  try {
+    want = JSON.parse(body);
+  } catch {
+    return sendJson(res, 400, { error: "invalid JSON" });
+  }
+  const flags = {};
+  for (const k of [TAG_FAVORITE, TAG_BAD]) {
+    if (k in (want ?? {})) {
+      if (typeof want[k] !== "boolean") return sendJson(res, 400, { error: `${k} must be a boolean` });
+      flags[k] = want[k];
+    }
+  }
+  if (!Object.keys(flags).length) return sendJson(res, 400, { error: "expected favorite and/or bad" });
+
+  const tags = await getTags(name); // fresh read, so tags set elsewhere survive
+  for (const [k, on] of Object.entries(flags)) {
+    if (on) tags[k] = "true";
+    else delete tags[k];
+  }
+  if (flags[TAG_BAD] === true && !(TAG_FAVORITE in flags)) delete tags[TAG_FAVORITE];
+  if (flags[TAG_FAVORITE] === true && !(TAG_BAD in flags)) delete tags[TAG_BAD];
+  await putTags(name, tags);
+  tagCache.set(name, { at: Date.now(), tags });
+  console.log(`tags ${name}: ${JSON.stringify(tags)}`);
+
+  sendJson(res, 200, { name, favorite: isFavorite(name), bad: isBad(name) });
 }
 
 function nameHeaders(name) {
@@ -386,8 +519,11 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     const pathname = url.pathname;
 
+    if (req.method === "POST" && pathname.startsWith("/api/wallpapers/")) {
+      return await serveSetTags(req, res, pathname.slice("/api/wallpapers/".length));
+    }
     if (req.method !== "GET" && req.method !== "HEAD") {
-      res.writeHead(405, { Allow: "GET, HEAD" });
+      res.writeHead(405, { Allow: "GET, HEAD, POST" });
       return res.end("Method not allowed");
     }
 

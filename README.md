@@ -126,6 +126,7 @@ server and are never sent to the browser.
 | `S3_REGION`  | `us-east-1`  | SigV4 signing region                             |
 | `S3_PREFIX`  | *(root)*     | "folder" inside the bucket to scan               |
 | `LIST_TTL`   | `60`         | seconds to cache the bucket listing              |
+| `TAG_TTL`    | `3600`       | seconds to cache each image's S3 tags            |
 
 Only objects directly under the prefix with an image extension are shown.
 
@@ -162,11 +163,27 @@ own.
 
 The cursor hides after 2s of no movement.
 
+## Favorite / bad
+
+Moving the mouse into the lower-right corner reveals two buttons:
+
+- **♥ favorite** toggles the S3 object tag `favorite=true` on the image on screen.
+- **⊘ bad** sets `bad=true` (and clears `favorite`). Images tagged `bad` are
+  dropped from the rotation, `/current` and `/random`, so the page moves on
+  right away. To bring an image back, remove the tag in the bucket (or `POST
+  {"bad": false}`).
+
+Other tags on the object are kept. Tags set outside the app show up within
+`TAG_TTL`.
+
 ## Endpoints
 
 - `GET /` — the page
 - `GET /favicon.svg` — the page icon, embedded in `server.mjs` (also served at `/favicon.ico`)
-- `GET /api/wallpapers` — `{ images, count, serverTime, slotSeconds }`
+- `GET /api/wallpapers` — `{ images, favorites, count, serverTime, slotSeconds }`
+  (`images` leaves out anything tagged `bad`)
+- `POST /api/wallpapers/<file>` — body `{"favorite": bool}` and/or `{"bad": bool}`;
+  sets/clears the S3 tags, returns `{ name, favorite, bad }`
 - `GET /wallpapers/<file>` — the raw image, proxied from S3 (ETag, `Range`, no re-encoding)
 - `GET /current` — the image scheduled right now, served directly (same bytes as
   `/wallpapers/<file>`), so it works as a plain image URL for other tools.

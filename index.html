@@ -52,6 +52,39 @@
     color: #888;
   }
   #message.on { display: grid; }
+
+  /* Rating buttons: hidden until the mouse comes near the lower-right corner. */
+  #rate {
+    position: fixed;
+    right: max(16px, env(safe-area-inset-right));
+    bottom: max(16px, env(safe-area-inset-bottom));
+    display: flex;
+    gap: 8px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 200ms ease;
+  }
+  #rate.near { opacity: 1; pointer-events: auto; }
+  #rate button {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: rgb(0 0 0 / 0.45);
+    color: rgb(255 255 255 / 0.85);
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    transition: background 150ms ease, color 150ms ease, transform 150ms ease;
+  }
+  #rate button:hover { background: rgb(0 0 0 / 0.7); transform: scale(1.08); }
+  #rate button:disabled { opacity: 0.5; cursor: progress; }
+  #rate button svg { width: 18px; height: 18px; }
+  #fav.on { color: #ff5a7a; }
+  #fav.on svg path { fill: currentColor; }
+  #bad:hover { color: #ffb347; }
 </style>
 </head>
 <body>
@@ -60,6 +93,18 @@
     <img class="layer" id="layerB" alt="" decoding="async" />
   </div>
   <div id="message">No wallpapers found — upload images to the S3 bucket.</div>
+  <div id="rate">
+    <button id="fav" type="button" title="Favorite" aria-label="Mark as favorite" aria-pressed="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 20.5s-7.5-4.6-9.3-9.2C1.4 8 3.4 4.5 7 4.5c2.1 0 3.6 1.2 5 3 1.4-1.8 2.9-3 5-3 3.6 0 5.6 3.5 4.3 6.8-1.8 4.6-9.3 9.2-9.3 9.2z"/>
+      </svg>
+    </button>
+    <button id="bad" type="button" title="Mark as bad (removes it from the rotation)" aria-label="Mark as bad">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/>
+      </svg>
+    </button>
+  </div>
 
 <script type="module">
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
@@ -71,6 +116,7 @@ const message = document.getElementById("message");
 
 let front = 0;              // index into layers[] currently visible
 let images = [];            // filenames, natural-sorted (server order)
+let favorites = new Set();  // filenames tagged favorite
 let clockOffset = 0;        // serverTime - Date.now() at last sync
 let currentIndex = null;    // image index currently shown
 let peekIndex = null;       // manual override via arrow keys
@@ -210,6 +256,7 @@ async function showImage(index, { instant = false } = {}) {
   }
   front = 1 - front;
 
+  updateRateButtons();
   preloadAround(index);
 }
 
@@ -257,6 +304,8 @@ async function sync({ firstRun = false } = {}) {
     data.images.length !== images.length ||
     data.images.some((n, i) => n !== images[i]);
   images = data.images;
+  favorites = new Set(data.favorites ?? []);
+  updateRateButtons();
 
   if (firstRun) {
     renderCurrent(true);
@@ -297,6 +346,65 @@ window.addEventListener("keydown", (e) => {
     renderCurrent(false);
   }
 });
+
+// --- rating (stored as S3 object tags) -------------------------------------
+
+const rate = document.getElementById("rate");
+const favBtn = document.getElementById("fav");
+const badBtn = document.getElementById("bad");
+const NEAR_PX = 180;
+
+window.addEventListener("mousemove", (e) => {
+  const near =
+    window.innerWidth - e.clientX < NEAR_PX && window.innerHeight - e.clientY < NEAR_PX;
+  rate.classList.toggle("near", near);
+}, { passive: true });
+document.documentElement.addEventListener("mouseleave", () => rate.classList.remove("near"));
+
+function updateRateButtons() {
+  const on = currentIndex != null && favorites.has(images[currentIndex]);
+  favBtn.classList.toggle("on", on);
+  favBtn.setAttribute("aria-pressed", String(on));
+  favBtn.title = on ? "Remove from favorites" : "Favorite";
+}
+
+async function setTags(name, flags) {
+  const res = await fetch("/api/wallpapers/" + encodeURIComponent(name), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(flags),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function rateCurrent(flags) {
+  const name = currentIndex != null ? images[currentIndex] : null;
+  if (!name) return;
+  favBtn.disabled = badBtn.disabled = true;
+  try {
+    const r = await setTags(name, flags);
+    if (r.favorite) favorites.add(name);
+    else favorites.delete(name);
+    updateRateButtons();
+    if (r.bad) {
+      // Gone from the rotation: reload the list and show what's scheduled now.
+      peekIndex = null;
+      currentIndex = null;
+      await sync();
+    }
+  } catch (err) {
+    console.error("rating failed:", err);
+  } finally {
+    favBtn.disabled = badBtn.disabled = false;
+  }
+}
+
+favBtn.addEventListener("click", () => {
+  const name = images[currentIndex];
+  rateCurrent({ favorite: !favorites.has(name) });
+});
+badBtn.addEventListener("click", () => rateCurrent({ bad: true }));
 
 // Tab was hidden/asleep, or window regained focus: recompute the slot.
 document.addEventListener("visibilitychange", () => {
